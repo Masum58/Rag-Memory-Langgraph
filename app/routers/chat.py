@@ -2,34 +2,16 @@
 # FILE: app/routers/chat.py
 # PURPOSE: /chat endpoint handle করা
 # CALLED BY: app/main.py → app.include_router(chat.router)
-# DEPENDS ON: app/graph.py → graph, builder
+# DEPENDS ON: app/graph.py → graph, builder, ChatState
 # =============================================================
 
-# APIRouter → FastAPI-তে endpoint group করার জন্য
-# prefix="/chat" মানে সব endpoint এ আগে /chat যোগ হবে
 from fastapi import APIRouter
-
-# BaseModel → request আর response এর shape define করার জন্য
 from pydantic import BaseModel
-
-# HumanMessage → user এর message কে LangChain format এ convert করে
 from langchain_core.messages import HumanMessage
-
-# AsyncPostgresSaver → PostgreSQL এ conversation save করার জন্য
-# async কেন: FastAPI async, তাই database call ও async হওয়া দরকার
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-
-# graph → compiled LangGraph graph
-# builder → checkpointer দিয়ে আবার compile করার জন্য
-from app.graph import graph, builder
-
+from app.graph import graph, builder, ChatState
 import os
 
-# =============================================================
-# ROUTER SETUP
-# prefix="/chat" → সব endpoint এ /chat আগে থাকবে
-# tags=["chat"] → FastAPI docs এ "chat" গ্রুপে দেখাবে
-# =============================================================
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 # =============================================================
@@ -95,3 +77,30 @@ async def chat(request: ChatRequest):
     # [-1] → শেষেরটা নাও, এটাই LLM এর জবাব
     # .content → AIMessage এর text বের করো
     return ChatResponse(reply=result['messages'][-1].content)
+
+# =============================================================
+# ENDPOINT: GET /chat/conversations
+# PURPOSE: সব saved conversation এর thread_id list দেওয়া
+# RETURNS: {"conversations": ["thread-1", "thread-2", ...]}
+# CALLED BY: streamlit_app.py → sidebar dropdown
+# =============================================================
+@router.get("/conversations")
+async def get_conversations():
+
+    DB_URI = os.getenv("DATABASE_URL")
+
+    async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
+        await checkpointer.setup()
+
+        # LangGraph এর checkpoints table থেকে unique thread_id গুলো আনো
+        # ORDER BY thread_id → alphabetical order এ দেখাবে
+        async with checkpointer.conn.cursor() as cur:
+            await cur.execute(
+                "SELECT DISTINCT thread_id FROM checkpoints ORDER BY thread_id"
+            )
+            rows = await cur.fetchall()
+
+    # rows → [{"thread_id": "abc"}, {"thread_id": "xyz"}, ...]
+    # list comprehension দিয়ে শুধু thread_id গুলো বের করো
+    conversations = [row["thread_id"] for row in rows]
+    return {"conversations": conversations}

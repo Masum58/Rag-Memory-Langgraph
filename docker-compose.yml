@@ -10,6 +10,15 @@ services:
     depends_on:
       - db
 
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile.streamlit
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
   db:
     image: postgres:15
     environment:

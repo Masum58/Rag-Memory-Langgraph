@@ -1,91 +1,132 @@
 # =============================================================
 # FILE: app/graph.py
-# PURPOSE: LangGraph graph বানানো এবং compile করা
-# CALLED BY: app/routers/chat.py → from app.graph import graph, builder
+# PURPOSE: LangGraph graph বানানো — summarization + remove সহ
+# CALLED BY: app/routers/chat.py → from app.graph import builder
 # =============================================================
 
-# trim_messages → conversation history trim করে token limit রাখে
-# count_tokens_approximately → কতটুকু token আছে সেটা count করে
-from langchain_core.messages import trim_messages
-from langchain_core.messages.utils import count_tokens_approximately
-
-# ChatOpenAI → OpenAI GPT model use করার জন্য
+from langchain_core.messages import HumanMessage, RemoveMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-
-# StateGraph → graph বানানোর main class
-# START → graph কোথা থেকে শুরু হবে
-# MessagesState → graph-এর shared notebook (messages list রাখে)
-from langgraph.graph import StateGraph, START, MessagesState
-
+from langgraph.graph import StateGraph, START, END, MessagesState
+from typing import Literal
 from dotenv import load_dotenv
 import os
 
-# .env file থেকে OPENAI_API_KEY, DATABASE_URL ইত্যাদি load করো
 load_dotenv()
 
-# LLM object — graph-এর ভেতরে এটাই কাজ করবে
-# DEFAULT: gpt-3.5-turbo, বদলাতে চাইলে → ChatOpenAI(model="gpt-4o-mini")
 model = ChatOpenAI()
 
 # =============================================================
-# MAX_TOKENS: conversation history-র maximum token limit
-# কেন: LLM-এ পুরো history পাঠালে cost বাড়ে, context limit ছাড়ায়
-# বাড়াতে চাইলে: 1000, 2000 — কমালে কম history মনে থাকবে
+# STATE: ChatState
+# PURPOSE: MessagesState extend করে summary field যোগ করা
+# FIELDS:
+#   messages → conversation history [HumanMessage, AIMessage, ...]
+#   summary  → পুরনো conversation এর compressed summary
+#              DEFAULT: "" — প্রথমবার কোনো summary নেই
 # =============================================================
-MAX_TOKENS = 500
+class ChatState(MessagesState):
+    summary: str = ""
 
 # =============================================================
-# FUNCTION: call_model
-# PURPOSE: state থেকে messages নেয়, trim করে, LLM-কে দেয়
-# PARAMETER: state → MessagesState (graph-এর shared notebook)
-#   state["messages"] এ থাকে: [HumanMessage, AIMessage, ...]
-# RETURNS: {"messages": [AIMessage]} → state-এ যোগ হয়
-# CALLED BY: graph-এর ভেতরে automatically, invoke() করলে
+# FUNCTION: chat_node
+# PURPOSE: summary + নতুন messages মিলিয়ে LLM call করা
+# PARAMETER: state → ChatState
+#   state["messages"] → নতুন messages
+#   state["summary"]  → আগের summary (থাকলে)
+# RETURNS: {"messages": [AIMessage]}
+# CALLED BY: graph automatically — invoke() করলে
 # =============================================================
-def call_model(state: MessagesState):
+def chat_node(state: ChatState):
 
-    # trim_messages → পুরো history না পাঠিয়ে শেষের 500 token রাখে
-    # strategy="last" → শেষের messages রাখো, পুরনোগুলো বাদ দাও
-    # token_counter → কতটুকু token সেটা count করার function
-    # max_tokens → এর বেশি token পাঠাবে না
-    # OUTPUT: trimmed messages list → [HumanMessage, AIMessage, ...]
-    messages = trim_messages(
-        state["messages"],
-        strategy="last",
-        token_counter=count_tokens_approximately,
-        max_tokens=MAX_TOKENS
-    )
+    # .get() দিয়ে check করো — summary না থাকলে "" return করবে
+    summary = state.get("summary", "")
 
-    # DEBUG: কতটুকু token আছে দেখতে চাইলে এই line uncomment করো
-    # print('Current Token Count ->', count_tokens_approximately(messages=messages))
+    # summary থাকলে SystemMessage হিসেবে আগে রাখো
+    # কেন: LLM জানবে আগে কী হয়েছিলো
+    messages = []
+    if summary:
+        messages.append(SystemMessage(
+            content=f"Conversation summary:\n{summary}"
+        ))
 
-    # LLM-কে trimmed messages দাও, জবাব নাও
-    # OUTPUT: AIMessage object → .content এ text থাকে
+    # summary এর পরে নতুন messages যোগ করো
+    messages.extend(state["messages"])
+
+    # LLM call করো
     response = model.invoke(messages)
 
-    # state-এ নতুন AIMessage যোগ করো
     return {"messages": [response]}
 
 # =============================================================
-# GRAPH SETUP
-# PURPOSE: node আর edge দিয়ে graph বানানো
-# CALLED BY: এই file import হলে automatically চলে
+# FUNCTION: summarize_node
+# PURPOSE: পুরনো messages summary করে delete করা
+# PARAMETER: state → ChatState
+# RETURNS: {"summary": নতুন summary, "messages": [RemoveMessage...]}
+# CALLED BY: graph automatically — should_summarize True হলে
 # =============================================================
+def summarize_node(state: ChatState):
 
-# MessagesState → graph-এর notebook type বলছো
-builder = StateGraph(MessagesState)
+    # .get() দিয়ে check করো — summary না থাকলে "" return করবে
+    existing_summary = state.get("summary", "")
 
-# 'call_model' নামে একটা node যোগ করো → call_model function চালাবে
-builder.add_node('call_model', call_model)
+    # আগের summary থাকলে extend করো, না থাকলে নতুন বানাও
+    # কেন: প্রতিবার পুরো summary নতুন করে বানানো costly
+    if existing_summary:
+        prompt = (
+            f"Existing summary:\n{existing_summary}\n\n"
+            "Extend the summary using the new conversation above."
+        )
+    else:
+        prompt = "Summarize the conversation above."
 
-# START → call_model → END (সবসময় এই path)
-builder.add_edge(START, 'call_model')
+    # সব messages + summary prompt LLM কে দাও
+    messages_for_summary = state["messages"] + [
+        HumanMessage(content=prompt)
+    ]
+    response = model.invoke(messages_for_summary)
+
+    # শেষের 2টা message রাখো, বাকি সব delete করো
+    # কেন 2টা রাখি: recent context থাকা দরকার
+    messages_to_delete = state["messages"][:-2]
+
+    return {
+        "summary": response.content,
+        # RemoveMessage → LangGraph কে বলছো এই id এর message delete করো
+        "messages": [RemoveMessage(id=m.id) for m in messages_to_delete]
+    }
+
+# =============================================================
+# FUNCTION: should_summarize
+# PURPOSE: summarize_node চালাবো কিনা সেটা decide করা
+# PARAMETER: state → ChatState
+# RETURNS: "summarize" অথবা END
+# CALLED BY: graph — chat_node এর পরে conditional edge হিসেবে
+# LOGIC: 10 এর বেশি messages হলে summarize করো
+# =============================================================
+def should_summarize(state: ChatState) -> Literal["summarize", END]:
+    if len(state["messages"]) > 10:
+        return "summarize"
+    return END
+
+# =============================================================
+# GRAPH SETUP
+# FLOW: START → chat_node → should_summarize?
+#                               → True  → summarize_node → END
+#                               → False → END
+# =============================================================
+builder = StateGraph(ChatState)
+
+builder.add_node("chat", chat_node)
+builder.add_node("summarize", summarize_node)
+
+builder.add_edge(START, "chat")
+
+# chat_node এর পরে should_summarize check করো
+builder.add_conditional_edges("chat", should_summarize)
+
+# summarize_node শেষ হলে END
+builder.add_edge("summarize", END)
 
 # graph compile করো — checkpointer chat.py তে দেওয়া হবে
-# কেন এখানে checkpointer নেই: AsyncPostgresSaver async,
-# তাই chat.py-তে request আসলে সেখানে initialize করা হয়
 graph = builder.compile()
 
-# DATABASE_URL → docker-compose.yml এর db service এর address
-# FORMAT: postgresql://username:password@service_name:port/db_name
 DB_URI = os.getenv("DATABASE_URL")
