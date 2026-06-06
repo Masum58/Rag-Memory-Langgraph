@@ -67,16 +67,22 @@ st.markdown("""
 #   messages    → UI তে দেখানোর জন্য conversation history
 #   thread_id   → এই session এর unique id — memory track করতে
 #   is_thinking → LLM call চলছে কিনা
+#   user_id     → long-term memory এর জন্য user identifier
 # =============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
 if "thread_id" not in st.session_state:
-    # প্রতিটা session এ নতুন unique thread_id বানাও
     st.session_state.thread_id = str(uuid.uuid4())
 
 if "is_thinking" not in st.session_state:
     st.session_state.is_thinking = False
+
+if "user_id" not in st.session_state:
+    # প্রতিটা browser session এ একটাই user_id
+    # thread_id বদলালেও user_id same থাকে
+    # কেন: একই user অনেক conversation করতে পারে
+    st.session_state.user_id = str(uuid.uuid4())
 
 # =============================================================
 # SIDEBAR
@@ -89,7 +95,6 @@ with st.sidebar:
     st.subheader("💬 Conversations")
 
     # PostgreSQL থেকে conversation list আনো
-    # কেন try/except: API down থাকলে crash করবে না
     try:
         res = requests.get("http://api:8000/chat/conversations")
         conversations = res.json()["conversations"]
@@ -97,18 +102,16 @@ with st.sidebar:
         conversations = []
 
     # current thread_id list এ না থাকলে যোগ করো
-    # কেন: নতুন conversation এখনো PostgreSQL এ নেই
     if st.session_state.thread_id not in conversations:
         conversations = [st.session_state.thread_id] + conversations
 
-    # New Conversation button — নতুন random ID বানাও
+    # New Conversation button
     if st.button("🆕 New Conversation", use_container_width=True):
         st.session_state.thread_id = str(uuid.uuid4())
         st.session_state.messages = []
         st.rerun()
 
     # নিজে ID লিখে দেওয়ার option
-    # কেন: পুরনো specific conversation load করতে
     custom_id = st.text_input(
         "অথবা নিজে ID লেখো",
         placeholder="thread-id লেখো...",
@@ -121,10 +124,8 @@ with st.sidebar:
 
     st.divider()
 
-    # Conversation dropdown — সব saved conversations
+    # Conversation dropdown
     if conversations:
-        # current thread_id কোন index এ আছে সেটা বের করো
-        # কেন: dropdown এ current conversation selected দেখাবে
         current_index = (
             conversations.index(st.session_state.thread_id)
             if st.session_state.thread_id in conversations
@@ -135,11 +136,9 @@ with st.sidebar:
             "Saved Conversations",
             options=conversations,
             index=current_index,
-            # thread_id লম্বা, শুধু প্রথম ৮ character দেখাও
             format_func=lambda x: f"💬 {x[:8]}..."
         )
 
-        # অন্য conversation select করলে load করো
         if selected != st.session_state.thread_id:
             st.session_state.thread_id = selected
             st.session_state.messages = []
@@ -148,23 +147,22 @@ with st.sidebar:
     else:
         st.caption("কোনো saved conversation নেই।")
 
-    # Refresh button — manually list refresh করতে
     if st.button("🔄 Refresh List", use_container_width=True):
         st.rerun()
 
     st.divider()
 
-    # Clear chat button — thread_id রাখো, শুধু UI clear করো
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
     st.divider()
 
-    # Stats
     st.subheader("📊 Stats")
     st.metric("Messages", len(st.session_state.messages))
     st.caption(f"Session: `{st.session_state.thread_id[:8]}...`")
+    # user_id দেখাও — debug এর জন্য
+    st.caption(f"User: `{st.session_state.user_id[:8]}...`")
 
 # =============================================================
 # MAIN CHAT AREA
@@ -174,7 +172,6 @@ st.divider()
 
 # =============================================================
 # CHAT HISTORY DISPLAY
-# PURPOSE: আগের messages গুলো bubble + timestamp সহ দেখানো
 # =============================================================
 for msg in st.session_state.messages:
     if msg["role"] == "user":
@@ -194,7 +191,6 @@ for msg in st.session_state.messages:
             unsafe_allow_html=True
         )
 
-# Typing indicator — LLM call চলার সময় দেখাবে
 if st.session_state.is_thinking:
     st.markdown(
         '<div class="thinking">🤖 thinking...</div>',
@@ -217,30 +213,22 @@ with st.form(key="chat_form", clear_on_submit=True):
 
 # =============================================================
 # API CALL
-# PURPOSE: FastAPI /chat/ endpoint call করা
-# URL: http://api:8000/chat/ — Docker network এ api service
-# কেন api:8000: Docker এ service name দিয়ে communicate করে
 # =============================================================
 if submitted and user_input:
 
-    # timestamp বানাও — "10:35 AM" format
     now = datetime.now().strftime("%I:%M %p")
 
-    # UI তে user message যোগ করো
     st.session_state.messages.append({
         "role": "user",
         "content": user_input,
         "time": now
     })
 
-    # thinking indicator চালু করো
     st.session_state.is_thinking = True
     st.rerun()
 
 # =============================================================
-# THINKING STATE — API call করো
-# কেন আলাদা block: rerun() এর পরে is_thinking True থাকলে
-# এই block চলবে, indicator দেখাবে তারপর API call করবে
+# THINKING STATE
 # =============================================================
 if st.session_state.is_thinking:
 
@@ -249,6 +237,9 @@ if st.session_state.is_thinking:
             "http://api:8000/chat/",
             json={
                 "thread_id": st.session_state.thread_id,
+                # user_id → long-term memory এর জন্য
+                # thread_id বদলালেও user_id same থাকে
+                "user_id": st.session_state.user_id,
                 "message": st.session_state.messages[-1]["content"]
             }
         )
@@ -259,13 +250,11 @@ if st.session_state.is_thinking:
 
     now = datetime.now().strftime("%I:%M %p")
 
-    # UI তে bot message যোগ করো
     st.session_state.messages.append({
         "role": "assistant",
         "content": reply,
         "time": now
     })
 
-    # thinking indicator বন্ধ করো
     st.session_state.is_thinking = False
     st.rerun()
