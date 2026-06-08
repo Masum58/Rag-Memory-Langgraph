@@ -57,6 +57,13 @@ st.markdown("""
             color: #999;
             font-style: italic;
         }
+        .doc-item {
+            background-color: #2d2d2d;
+            padding: 8px 12px;
+            border-radius: 8px;
+            margin: 4px 0;
+            font-size: 12px;
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -65,9 +72,11 @@ st.markdown("""
 # PURPOSE: browser refresh না হওয়া পর্যন্ত data রাখা
 # FIELDS:
 #   messages    → UI তে দেখানোর জন্য conversation history
-#   thread_id   → এই session এর unique id — memory track করতে
+#   thread_id   → এই session এর unique id — short-term memory
 #   is_thinking → LLM call চলছে কিনা
-#   user_id     → long-term memory এর জন্য user identifier
+#   user_id     → long-term memory + document namespace এর জন্য
+#                 browser session জুড়ে same থাকে
+#                 thread_id বদলালেও user_id বদলায় না
 # =============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -79,19 +88,18 @@ if "is_thinking" not in st.session_state:
     st.session_state.is_thinking = False
 
 if "user_id" not in st.session_state:
-    # প্রতিটা browser session এ একটাই user_id
-    # thread_id বদলালেও user_id same থাকে
-    # কেন: একই user অনেক conversation করতে পারে
     st.session_state.user_id = str(uuid.uuid4())
 
 # =============================================================
 # SIDEBAR
-# PURPOSE: conversation management
 # =============================================================
 with st.sidebar:
     st.title("⚙️ Settings")
     st.divider()
 
+    # =============================================================
+    # CONVERSATION SECTION
+    # =============================================================
     st.subheader("💬 Conversations")
 
     # PostgreSQL থেকে conversation list আনো
@@ -111,7 +119,7 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
-    # নিজে ID লিখে দেওয়ার option
+    # নিজে ID লিখে load করার option
     custom_id = st.text_input(
         "অথবা নিজে ID লেখো",
         placeholder="thread-id লেখো...",
@@ -124,7 +132,7 @@ with st.sidebar:
 
     st.divider()
 
-    # Conversation dropdown
+    # Conversation dropdown — সব saved conversations
     if conversations:
         current_index = (
             conversations.index(st.session_state.thread_id)
@@ -156,12 +164,93 @@ with st.sidebar:
         st.session_state.messages = []
         st.rerun()
 
+    # =============================================================
+    # DOCUMENT UPLOAD SECTION
+    # PURPOSE: user নিজের document upload করবে
+    # user_id automatically যাবে — user জানবেও না
+    # প্রতিটা user এর document আলাদা namespace এ Pinecone এ থাকবে
+    # PostgreSQL এ filename + chunks + date record থাকবে
+    # =============================================================
     st.divider()
+    st.subheader("📁 My Documents")
 
+    # এই user এর uploaded documents list আনো
+    # কেন: user জানতে পারবে কোন কোন file upload করেছে
+    try:
+        doc_res = requests.get(
+            "http://api:8000/documents/list",
+            params={"user_id": st.session_state.user_id}
+        )
+        doc_data = doc_res.json()
+        docs = doc_data.get("documents", [])
+
+        if docs:
+            for doc in docs:
+                # uploaded_at datetime string থেকে শুধু date নাও
+                uploaded_at = str(doc["uploaded_at"])[:10]
+                st.markdown(
+                    f'<div class="doc-item">'
+                    f'📄 <b>{doc["filename"]}</b><br>'
+                    f'<span style="color:#999">{doc["chunks"]} chunks • {uploaded_at}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+        else:
+            st.caption("কোনো document upload করা নেই।")
+
+    except:
+        st.caption("Document list unavailable")
+
+    # File uploader
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+    uploaded_file = st.file_uploader(
+        "PDF বা TXT upload করো",
+        type=["pdf", "txt"],
+        label_visibility="collapsed"
+    )
+
+    if uploaded_file is not None:
+        st.caption(f"📄 Selected: `{uploaded_file.name}`")
+
+        if st.button("📤 Index Document", use_container_width=True):
+            with st.spinner("Pinecone এ index করা হচ্ছে..."):
+                try:
+                    # user_id Form field হিসেবে পাঠাও
+                    # কেন Form: file upload এর সাথে extra data পাঠাতে Form লাগে
+                    # data={"user_id": ...} → Form field
+                    # files={"file": ...} → file upload
+                    upload_res = requests.post(
+                        "http://api:8000/documents/upload",
+                        files={
+                            "file": (
+                                uploaded_file.name,
+                                uploaded_file.getvalue(),
+                                uploaded_file.type
+                            )
+                        },
+                        data={"user_id": st.session_state.user_id}
+                    )
+
+                    if upload_res.status_code == 200:
+                        res_data = upload_res.json()
+                        st.success(
+                            f"✅ **{res_data['filename']}** indexed!\n\n"
+                            f"({res_data['chunks_indexed']} chunks)"
+                        )
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Upload failed: {upload_res.text}")
+
+                except Exception as e:
+                    st.error(f"⚠️ Error: {str(e)}")
+
+    # =============================================================
+    # STATS SECTION
+    # =============================================================
+    st.divider()
     st.subheader("📊 Stats")
     st.metric("Messages", len(st.session_state.messages))
     st.caption(f"Session: `{st.session_state.thread_id[:8]}...`")
-    # user_id দেখাও — debug এর জন্য
     st.caption(f"User: `{st.session_state.user_id[:8]}...`")
 
 # =============================================================
@@ -172,6 +261,7 @@ st.divider()
 
 # =============================================================
 # CHAT HISTORY DISPLAY
+# PURPOSE: আগের messages গুলো bubble + timestamp সহ দেখানো
 # =============================================================
 for msg in st.session_state.messages:
     if msg["role"] == "user":
@@ -191,6 +281,7 @@ for msg in st.session_state.messages:
             unsafe_allow_html=True
         )
 
+# Typing indicator
 if st.session_state.is_thinking:
     st.markdown(
         '<div class="thinking">🤖 thinking...</div>',
@@ -213,6 +304,8 @@ with st.form(key="chat_form", clear_on_submit=True):
 
 # =============================================================
 # API CALL
+# PURPOSE: FastAPI /chat/ endpoint call করা
+# URL: http://api:8000/chat/ — Docker network এ api service
 # =============================================================
 if submitted and user_input:
 
@@ -228,7 +321,9 @@ if submitted and user_input:
     st.rerun()
 
 # =============================================================
-# THINKING STATE
+# THINKING STATE — API call করো
+# কেন আলাদা block: rerun() এর পরে is_thinking True থাকলে
+# এই block চলবে — thinking indicator দেখাবে তারপর API call
 # =============================================================
 if st.session_state.is_thinking:
 
@@ -237,8 +332,6 @@ if st.session_state.is_thinking:
             "http://api:8000/chat/",
             json={
                 "thread_id": st.session_state.thread_id,
-                # user_id → long-term memory এর জন্য
-                # thread_id বদলালেও user_id same থাকে
                 "user_id": st.session_state.user_id,
                 "message": st.session_state.messages[-1]["content"]
             }

@@ -1,7 +1,7 @@
 # =============================================================
 # FILE: app/database.py
-# PURPOSE: user_memories table বানানো এবং CRUD operations
-# CALLED BY: app/graph.py → memory load/save করতে
+# PURPOSE: database table setup
+# CALLED BY: app/main.py → lifespan
 # =============================================================
 
 import os
@@ -10,71 +10,60 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# =============================================================
-# FUNCTION: get_connection
-# PURPOSE: PostgreSQL connection নেওয়া
-# RETURNS: asyncpg connection object
-# =============================================================
 async def get_connection():
     return await asyncpg.connect(os.getenv("DATABASE_URL"))
 
 # =============================================================
-# FUNCTION: setup_memory_table
-# PURPOSE: user_memories table বানানো — না থাকলে
-# TABLE STRUCTURE:
-#   user_id   → কোন user এর memory (thread_id এর prefix)
-#   key       → memory এর নাম, যেমন "name", "city"
-#   value     → memory এর value, যেমন "Masum", "Dhaka"
-#   updated_at → কখন update হয়েছে
-# CALLED BY: chat.py → startup এ একবার
+# FUNCTION: setup_tables
+# PURPOSE: দুটো table বানানো — না থাকলে
+# TABLES:
+#   uploaded_documents → কোন user কোন file upload করেছে
+# CALLED BY: app/main.py → lifespan startup
 # =============================================================
-async def setup_memory_table():
+async def setup_tables():
     conn = await get_connection()
     await conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_memories (
-            user_id    TEXT NOT NULL,
-            key        TEXT NOT NULL,
-            value      TEXT NOT NULL,
-            updated_at TIMESTAMP DEFAULT NOW(),
-            PRIMARY KEY (user_id, key)
+        CREATE TABLE IF NOT EXISTS uploaded_documents (
+            id          SERIAL PRIMARY KEY,
+            user_id     TEXT NOT NULL,
+            filename    TEXT NOT NULL,
+            chunks      INTEGER NOT NULL,
+            uploaded_at TIMESTAMP DEFAULT NOW()
         )
     """)
     await conn.close()
 
 # =============================================================
-# FUNCTION: get_memories
-# PURPOSE: একজন user এর সব memory আনা
-# PARAMETER: user_id → যার memory চাই
-# RETURNS: {"name": "Masum", "city": "Dhaka", ...}
-# CALLED BY: graph.py → memory_load_node
+# FUNCTION: save_document_record
+# PURPOSE: upload হলে PostgreSQL এ record রাখো
+# PARAMETER:
+#   user_id  → কোন user এর
+#   filename → কোন file
+#   chunks   → কতটা chunk index হয়েছে
+# CALLED BY: documents.py → upload_document
 # =============================================================
-async def get_memories(user_id: str) -> dict:
+async def save_document_record(user_id: str, filename: str, chunks: int):
     conn = await get_connection()
-    rows = await conn.fetch(
-        "SELECT key, value FROM user_memories WHERE user_id = $1",
-        user_id
-    )
+    await conn.execute("""
+        INSERT INTO uploaded_documents (user_id, filename, chunks)
+        VALUES ($1, $2, $3)
+    """, user_id, filename, chunks)
     await conn.close()
-    # rows → [{"key": "name", "value": "Masum"}, ...]
-    # dict comprehension দিয়ে → {"name": "Masum", ...}
-    return {row["key"]: row["value"] for row in rows}
 
 # =============================================================
-# FUNCTION: save_memories
-# PURPOSE: memory save বা update করা — duplicate হবে না
-# PARAMETER:
-#   user_id  → যার memory
-#   memories → {"name": "Masum", "city": "Dhaka"}
-# CALLED BY: graph.py → memory_extract_node
-# ON CONFLICT → same key থাকলে update করো, duplicate না
+# FUNCTION: get_user_documents
+# PURPOSE: একজন user এর সব uploaded documents আনা
+# PARAMETER: user_id → যার documents চাই
+# RETURNS: [{"filename": "...", "chunks": 10, "uploaded_at": "..."}]
+# CALLED BY: documents.py → list_documents
 # =============================================================
-async def save_memories(user_id: str, memories: dict):
+async def get_user_documents(user_id: str) -> list:
     conn = await get_connection()
-    for key, value in memories.items():
-        await conn.execute("""
-            INSERT INTO user_memories (user_id, key, value, updated_at)
-            VALUES ($1, $2, $3, NOW())
-            ON CONFLICT (user_id, key)
-            DO UPDATE SET value = $3, updated_at = NOW()
-        """, user_id, key, value)
+    rows = await conn.fetch("""
+        SELECT filename, chunks, uploaded_at
+        FROM uploaded_documents
+        WHERE user_id = $1
+        ORDER BY uploaded_at DESC
+    """, user_id)
     await conn.close()
+    return [dict(row) for row in rows]
