@@ -35,10 +35,6 @@ memory_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 # request এ নতুন connection খোলে, এটা avoid করা হচ্ছে
 embeddings = OpenAIEmbeddings(model="text-embedding-ada-002")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "ragmemory")
-vector_store = PineconeVectorStore(
-    index_name=INDEX_NAME,
-    embedding=embeddings
-)
 
 # =============================================================
 # STATE: ChatState
@@ -47,11 +43,13 @@ vector_store = PineconeVectorStore(
 #   messages       → conversation history [HumanMessage, AIMessage]
 #   summary        → পুরনো conversation এর compressed summary
 #   retrieved_docs → Pinecone থেকে আসা relevant chunks
+#   uploaded_files → user এর uploaded files list (chat.py থেকে আসে)
 # NOTE: user_id config থেকে আসে, state এ নেই
 # =============================================================
 class ChatState(MessagesState):
     summary: str = ""
-    retrieved_docs: str = ""  # retrieval_node এখানে লিখবে
+    retrieved_docs: str = ""
+    uploaded_files: str = ""  # user এর uploaded files list
 
 # =============================================================
 # MEMORY MODELS
@@ -92,6 +90,9 @@ TASK:
 SYSTEM_PROMPT = """তুমি একজন helpful AI assistant যার memory এবং document knowledge base আছে।
 user যে ভাষায় কথা বলবে, তুমি সেই ভাষায় reply করবে।
 
+User এর uploaded files:
+{uploaded_files}
+
 Document knowledge base থেকে পাওয়া প্রাসঙ্গিক তথ্য (Context):
 {document_context}
 
@@ -99,8 +100,8 @@ User সম্পর্কে personal তথ্য (User Memory):
 {user_details_content}
 
 গুরুত্বপূর্ণ নির্দেশনা:
-1. Context এ যে তথ্য আছে তা user এর upload করা document থেকে আনা হয়েছে।
-2. User যদি document এর বিষয়ে জিজ্ঞেস করে, Context থেকে সঠিক তথ্য দাও।
+1. User যদি তার uploaded files সম্পর্কে জিজ্ঞেস করে, উপরের list থেকে বলো।
+2. Context এ যে তথ্য আছে তা user এর upload করা document থেকে আনা হয়েছে।
 3. Context এ উত্তর না থাকলে নিজের জ্ঞান থেকে উত্তর দাও।
 4. কখনো বলবে না "I don't have access to files"।
 """
@@ -121,6 +122,7 @@ def remember_node(state: ChatState, config: RunnableConfig, *, store: BaseStore)
     ns = ("user", user_id, "details")
 
     # PostgresStore থেকে existing memories আনো
+    # OUTPUT: [Item(value={"data": "..."}, ...), ...]
     items = store.search(ns)
     existing = "\n".join(
         it.value.get("data", "") for it in items
@@ -142,6 +144,7 @@ def remember_node(state: ChatState, config: RunnableConfig, *, store: BaseStore)
     if decision.should_write:
         for mem in decision.memories:
             if mem.is_new and mem.text.strip():
+                # uuid4() → unique key, duplicate key হবে না
                 store.put(ns, str(uuid.uuid4()), {"data": mem.text.strip()})
 
     return {}
@@ -149,9 +152,15 @@ def remember_node(state: ChatState, config: RunnableConfig, *, store: BaseStore)
 # =============================================================
 # FUNCTION: retrieval_node
 # PURPOSE: user এর নিজের namespace থেকে relevant docs আনা
-# PARAMETER: state → ChatState, config → user_id এখানে থাকে
+# PARAMETER:
+#   state  → ChatState
+#   config → user_id এখানে থাকে
 # RETURNS: {"retrieved_docs": "chunk1\n---\nchunk2"}
 # CALLED BY: graph → remember_node এর পরে
+# কেন আলাদা node: separation of concerns
+#   remember_node → memory
+#   retrieval_node → document search
+#   chat_node → LLM call
 # =============================================================
 def retrieval_node(state: ChatState, config: RunnableConfig):
 
@@ -166,6 +175,10 @@ def retrieval_node(state: ChatState, config: RunnableConfig):
             embedding=embeddings,
             namespace=user_id
         )
+
+        # similarity_search → user message এর সাথে মিলিয়ে top-3 chunks
+        # k=3 → top 3 most relevant chunks
+        # OUTPUT: [Document(page_content="...", metadata={...}), ...]
         docs = user_vector_store.similarity_search(last_user_message, k=3)
 
         if docs:
@@ -180,9 +193,9 @@ def retrieval_node(state: ChatState, config: RunnableConfig):
 
 # =============================================================
 # FUNCTION: chat_node
-# PURPOSE: memory + retrieved_docs + summary দিয়ে LLM call করা
+# PURPOSE: memory + retrieved_docs + uploaded_files + summary দিয়ে LLM call
 # PARAMETER:
-#   state  → ChatState (retrieved_docs এখানে আছে)
+#   state  → ChatState
 #   config → user_id এখানে থাকে
 #   store  → PostgresStore — LangGraph automatically inject করে
 # RETURNS: {"messages": [AIMessage]}
@@ -199,18 +212,23 @@ def chat_node(state: ChatState, config: RunnableConfig, *, store: BaseStore):
         it.value.get("data", "") for it in items
     ) if items else "(empty)"
 
-    # retrieval_node এর output — state থেকে পড়ো
+    # retrieval_node এর output — Pinecone থেকে আসা chunks
     document_context = state.get("retrieved_docs", "(কোনো document নেই)")
+
+    # chat.py থেকে আসা uploaded files list
+    # কেন state এ: database call chat.py তে করা হয়, graph এ না
+    uploaded_files = state.get("uploaded_files", "(কোনো file নেই)")
 
     summary = state.get("summary", "")
 
     messages = []
 
-    # System prompt — memory + document context + language
+    # System prompt — memory + document context + files list + language
     messages.append(SystemMessage(
         content=SYSTEM_PROMPT.format(
             user_details_content=user_details,
-            document_context=document_context
+            document_context=document_context,
+            uploaded_files=uploaded_files
         )
     ))
 
@@ -250,6 +268,7 @@ def summarize_node(state: ChatState):
     response = model.invoke(messages_for_summary)
 
     # শেষের 2টা message রাখো, বাকি delete করো
+    # কেন 2টা রাখি: recent context থাকা দরকার
     messages_to_delete = state["messages"][:-2]
 
     return {
@@ -274,7 +293,7 @@ def should_summarize(state: ChatState) -> Literal["summarize", END]:
 #   START
 #     → remember      (long-term memory extract + save)
 #     → retrieval     (Pinecone থেকে relevant docs আনো)
-#     → chat          (memory + docs + summary → LLM)
+#     → chat          (memory + docs + files + summary → LLM)
 #     → should_summarize?
 #         → True  → summarize → END
 #         → False → END

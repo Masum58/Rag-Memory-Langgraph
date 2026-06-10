@@ -2,7 +2,7 @@
 # FILE: app/routers/chat.py
 # PURPOSE: /chat endpoint handle করা
 # CALLED BY: app/main.py
-# DEPENDS ON: app/graph.py → builder
+# DEPENDS ON: app/graph.py → builder, ChatState
 # =============================================================
 
 from fastapi import APIRouter
@@ -10,14 +10,18 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres import PostgresStore
-from app.graph import builder
+from app.graph import builder, ChatState  # ChatState import করো
+from app.database import get_user_documents
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 class ChatRequest(BaseModel):
     thread_id: str
-    user_id: str      # long-term memory এর জন্য
+    user_id: str
     message: str
 
 class ChatResponse(BaseModel):
@@ -26,14 +30,21 @@ class ChatResponse(BaseModel):
 @router.post("/", response_model=ChatResponse)
 async def chat(request: ChatRequest):
 
+    logger.info(f"CHAT → thread_id: {request.thread_id} | user_id: {request.user_id}")
+
     DB_URI = os.getenv("DATABASE_URL")
 
-    # short-term memory → AsyncPostgresSaver
-    # long-term memory → PostgresStore
+    # user এর uploaded files list আনো
+    # কেন এখানে: database call async, graph এ করা যায় না
+    docs = await get_user_documents(request.user_id)
+    files_list = "\n".join([
+        f"- {doc['filename']} ({doc['chunks']} chunks)"
+        for doc in docs
+    ]) if docs else "(কোনো file upload করা নেই)"
+
     async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
         await checkpointer.setup()
 
-        # PostgresStore → sync, context manager দিয়ে
         with PostgresStore.from_conn_string(DB_URI) as store:
             store.setup()
 
@@ -50,7 +61,10 @@ async def chat(request: ChatRequest):
             }
 
             result = await compiled_graph.ainvoke(
-                {'messages': [HumanMessage(content=request.message)]},
+                {
+                    'messages': [HumanMessage(content=request.message)],
+                    'uploaded_files': files_list,
+                },
                 config=config
             )
 
